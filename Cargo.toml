@@ -1,0 +1,24 @@
+[package]
+name = "rhaicp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.54", features = ["derive"] }
+rhai = { version = "1.23.6", features = ["sync"] }
+rmcp = { version = "0.12.0", features = ["client", "transport-child-process", "transport-io"] }
+sacp = "10.1.0"
+sacp-tokio = "10.1.0"
+serde_json = "1.0.148"
+tokio = { version = "1.49.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+uuid = { version = "1.19.0", features = ["v4"] }
+
+[dev-dependencies]
+expect-test = "1.5.1"
+sacp-conductor = "10.0.1"
+tokio-util = { version = "0.7.18", features = ["compat"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+yopo = "10.0.1"
