@@ -1279,7 +1279,6 @@ dependencies = [
  "sacp-tokio",
  "serde_json",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",

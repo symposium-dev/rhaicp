@@ -19,6 +19,4 @@ uuid = { version = "1.19.0", features = ["v4"] }
 [dev-dependencies]
 expect-test = "1.5.1"
 sacp-conductor = "10.0.1"
-tokio-util = { version = "0.7.18", features = ["compat"] }
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 yopo = "10.0.1"
