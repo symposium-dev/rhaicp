@@ -1,7 +1,14 @@
 [package]
 name = "rhaicp"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+description = "An ACP agent that executes Rhai scripts with MCP tool access"
+license = "MIT OR Apache-2.0"
+authors = ["Niko Matsakis <niko@alum.mit.edu>"]
+repository = "https://github.com/nikomatsakis/rhaicp"
+readme = "README.md"
+keywords = ["ACP", "Rhai"]
+categories = ["development-tools"]
 
 [dependencies]
 anyhow = "1.0.100"
