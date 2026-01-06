@@ -177,11 +177,7 @@ impl RhaiAgent {
         mcp_servers: &[McpServer],
         server_name: &str,
     ) -> Result<Vec<String>, String> {
-        use rmcp::{
-            ServiceExt,
-            transport::{ConfigureCommandExt, TokioChildProcess},
-        };
-        use tokio::process::Command;
+        use rmcp::ServiceExt;
 
         let mcp_server = mcp_servers
             .iter()
@@ -195,6 +191,9 @@ impl RhaiAgent {
 
         match mcp_server {
             McpServer::Stdio(stdio) => {
+                use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+                use tokio::process::Command;
+
                 let transport = TokioChildProcess::new(
                     Command::new(&stdio.command).configure(|cmd| {
                         cmd.args(&stdio.args);
@@ -223,7 +222,30 @@ impl RhaiAgent {
                     .map(|t| t.name.to_string())
                     .collect())
             }
-            _ => Err("Only stdio MCP servers are currently supported".to_string()),
+            McpServer::Http(http) => {
+                use rmcp::transport::StreamableHttpClientTransport;
+
+                let transport = StreamableHttpClientTransport::from_uri(http.url.clone());
+
+                let mcp_client = ()
+                    .serve(transport)
+                    .await
+                    .map_err(|e| format!("Failed to connect to HTTP MCP server: {}", e))?;
+
+                let tools_result = mcp_client
+                    .list_tools(None)
+                    .await
+                    .map_err(|e| format!("Failed to list tools: {}", e))?;
+
+                let _ = mcp_client.cancel().await;
+
+                Ok(tools_result
+                    .tools
+                    .into_iter()
+                    .map(|t| t.name.to_string())
+                    .collect())
+            }
+            _ => Err("SSE MCP servers are not currently supported".to_string()),
         }
     }
 
@@ -234,12 +256,7 @@ impl RhaiAgent {
         tool_name: &str,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        use rmcp::{
-            ServiceExt,
-            model::CallToolRequestParam,
-            transport::{ConfigureCommandExt, TokioChildProcess},
-        };
-        use tokio::process::Command;
+        use rmcp::{ServiceExt, model::CallToolRequestParam};
 
         let mcp_server = mcp_servers
             .iter()
@@ -253,6 +270,9 @@ impl RhaiAgent {
 
         match mcp_server {
             McpServer::Stdio(stdio) => {
+                use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+                use tokio::process::Command;
+
                 let transport = TokioChildProcess::new(
                     Command::new(&stdio.command).configure(|cmd| {
                         cmd.args(&stdio.args);
@@ -278,12 +298,56 @@ impl RhaiAgent {
 
                 let _ = mcp_client.cancel().await;
 
-                serde_json::to_value(&tool_result)
-                    .map_err(|e| format!("Failed to serialize result: {}", e))
+                extract_tool_result(tool_result)
             }
-            _ => Err("Only stdio MCP servers are currently supported".to_string()),
+            McpServer::Http(http) => {
+                use rmcp::transport::StreamableHttpClientTransport;
+
+                let transport = StreamableHttpClientTransport::from_uri(http.url.clone());
+
+                let mcp_client = ()
+                    .serve(transport)
+                    .await
+                    .map_err(|e| format!("Failed to connect to HTTP MCP server: {}", e))?;
+
+                let tool_result = mcp_client
+                    .call_tool(CallToolRequestParam {
+                        name: tool_name.to_string().into(),
+                        arguments: args.as_object().cloned(),
+                    })
+                    .await
+                    .map_err(|e| format!("Failed to call tool: {}", e))?;
+
+                let _ = mcp_client.cancel().await;
+
+                extract_tool_result(tool_result)
+            }
+            _ => Err("SSE MCP servers are not currently supported".to_string()),
         }
     }
+}
+
+/// Extract the result value from a CallToolResult.
+/// Prefers structured_content if available, otherwise tries to parse
+/// the first text content item as JSON, falling back to returning it as a string.
+fn extract_tool_result(result: rmcp::model::CallToolResult) -> Result<serde_json::Value, String> {
+    // Prefer structured_content if available
+    if let Some(structured) = result.structured_content {
+        return Ok(structured);
+    }
+
+    // Fall back to first text content
+    if let Some(content) = result.content.first() {
+        if let Some(text_content) = content.as_text() {
+            // Try parsing as JSON to preserve types (numbers, booleans, objects, etc.)
+            // If that fails, return as a plain string
+            return Ok(serde_json::from_str(&text_content.text)
+                .unwrap_or_else(|_| serde_json::Value::String(text_content.text.clone())));
+        }
+    }
+
+    // No usable content
+    Err("Tool returned no content".to_string())
 }
 
 impl Default for RhaiAgent {
