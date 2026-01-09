@@ -35,15 +35,17 @@ impl From<McpModule> for Module {
                 match response_rx.recv() {
                     Ok(Ok(tools)) => {
                         // Convert Vec<String> to Rhai Array
-                        tools.into_iter().map(Dynamic::from).collect::<Vec<_>>().into()
+                        tools
+                            .into_iter()
+                            .map(Dynamic::from)
+                            .collect::<Vec<_>>()
+                            .into()
                     }
                     Ok(Err(e)) => {
                         // Return error as a string - Rhai can check for this
                         Dynamic::from(format!("ERROR: {}", e))
                     }
-                    Err(_) => {
-                        Dynamic::from("ERROR: Channel closed")
-                    }
+                    Err(_) => Dynamic::from("ERROR: Channel closed"),
                 }
             });
 
@@ -52,33 +54,32 @@ impl From<McpModule> for Module {
         let tx = mcp.msg_tx.clone();
         FuncRegistration::new("call_tool")
             .in_global_namespace()
-            .set_into_module(&mut module, move |server: &str, tool: &str, args: Dynamic| -> Dynamic {
-                let (response_tx, response_rx) = std::sync::mpsc::channel();
+            .set_into_module(
+                &mut module,
+                move |server: &str, tool: &str, args: Dynamic| -> Dynamic {
+                    let (response_tx, response_rx) = std::sync::mpsc::channel();
 
-                // Convert Rhai Dynamic to serde_json::Value
-                let json_args = dynamic_to_json(&args);
+                    // Convert Rhai Dynamic to serde_json::Value
+                    let json_args = dynamic_to_json(&args);
 
-                let _ = tx.send(RhaiMessage::CallTool {
-                    server: server.to_string(),
-                    tool: tool.to_string(),
-                    args: json_args,
-                    response_tx,
-                });
+                    let _ = tx.send(RhaiMessage::CallTool {
+                        server: server.to_string(),
+                        tool: tool.to_string(),
+                        args: json_args,
+                        response_tx,
+                    });
 
-                // Block waiting for the async runtime to respond
-                match response_rx.recv() {
-                    Ok(Ok(result)) => {
-                        // Convert JSON result back to Dynamic
-                        json_to_dynamic(&result)
+                    // Block waiting for the async runtime to respond
+                    match response_rx.recv() {
+                        Ok(Ok(result)) => {
+                            // Convert JSON result back to Dynamic
+                            json_to_dynamic(&result)
+                        }
+                        Ok(Err(e)) => Dynamic::from(format!("ERROR: {}", e)),
+                        Err(_) => Dynamic::from("ERROR: Channel closed"),
                     }
-                    Ok(Err(e)) => {
-                        Dynamic::from(format!("ERROR: {}", e))
-                    }
-                    Err(_) => {
-                        Dynamic::from("ERROR: Channel closed")
-                    }
-                }
-            });
+                },
+            );
 
         module
     }
