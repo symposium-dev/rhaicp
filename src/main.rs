@@ -55,9 +55,7 @@ async fn main() -> Result<()> {
     match args.command {
         Command::Acp => {
             tracing::info!("Rhaicp starting");
-            RhaiAgent::new()
-                .serve(sacp_tokio::Stdio::new())
-                .await?;
+            RhaiAgent::new().serve(sacp_tokio::Stdio::new()).await?;
         }
     }
 

@@ -7,7 +7,7 @@ use sacp::schema::{
     AgentCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
     LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse,
     PromptRequest, PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason,
-    TextContent,
+    TextContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use sacp::{AgentToClient, Component, JrConnectionCx, JrRequestCx};
 use std::collections::HashMap;
@@ -30,6 +30,8 @@ pub enum RhaiMessage {
         args: serde_json::Value,
         response_tx: std::sync::mpsc::Sender<Result<serde_json::Value, String>>,
     },
+    /// Write a file on disk
+    WriteFile { path: String, content: String },
 }
 
 /// Session data for each active session
@@ -104,7 +106,11 @@ impl RhaiAgent {
         let input_text = extract_text_from_prompt(&request.prompt);
         let script = extract_rhai_script(&input_text);
 
-        tracing::debug!("Executing Rhai script in session {}: {}", session_id, script);
+        tracing::debug!(
+            "Executing Rhai script in session {}: {}",
+            session_id,
+            script
+        );
 
         // Get MCP servers for this session
         let mcp_servers = self.get_mcp_servers(&session_id).unwrap_or_default();
@@ -114,9 +120,8 @@ impl RhaiAgent {
 
         // Spawn blocking task to run Rhai
         let script_clone = script.clone();
-        let rhai_handle = tokio::task::spawn_blocking(move || {
-            run_rhai_script(&script_clone, msg_tx)
-        });
+        let rhai_handle =
+            tokio::task::spawn_blocking(move || run_rhai_script(&script_clone, msg_tx));
 
         // Process messages from Rhai execution
         while let Some(msg) = msg_rx.recv().await {
@@ -128,7 +133,10 @@ impl RhaiAgent {
                         SessionUpdate::AgentMessageChunk(ContentChunk::new(text.into())),
                     ))?;
                 }
-                RhaiMessage::ListTools { server, response_tx } => {
+                RhaiMessage::ListTools {
+                    server,
+                    response_tx,
+                } => {
                     let result = self.list_tools_async(&mcp_servers, &server).await;
                     let _ = response_tx.send(result);
                 }
@@ -138,8 +146,50 @@ impl RhaiAgent {
                     args,
                     response_tx,
                 } => {
-                    let result = self.call_tool_async(&mcp_servers, &server, &tool, &args).await;
+                    let result = self
+                        .call_tool_async(&mcp_servers, &server, &tool, &args)
+                        .await;
                     let _ = response_tx.send(result);
+                }
+                RhaiMessage::WriteFile { path, content } => {
+                    // Attempt to write the file asynchronously
+                    let write_result = tokio::fs::write(&path, content).await;
+                    match write_result {
+                        Ok(_) => {
+                            let update = ToolCallUpdate::new(
+                                "write_file_id",
+                                ToolCallUpdateFields::new()
+                                    .status(ToolCallStatus::Completed)
+                                    .locations(vec![ToolCallLocation::new(path)])
+                                    .content(vec![
+                                        ContentBlock::Text(TextContent::new(
+                                            "Finished writing file.",
+                                        ))
+                                        .into(),
+                                    ]),
+                            );
+                            cx.send_notification(SessionNotification::new(
+                                session_id.clone(),
+                                SessionUpdate::ToolCallUpdate(update),
+                            ))?;
+                        }
+                        Err(e) => {
+                            let update = ToolCallUpdate::new(
+                                "write_file_id",
+                                ToolCallUpdateFields::new()
+                                    .status(ToolCallStatus::Failed)
+                                    .locations(vec![ToolCallLocation::new(path)])
+                                    .content(vec![
+                                        ContentBlock::Text(TextContent::new(format!("{:?}", e)))
+                                            .into(),
+                                    ]),
+                            );
+                            cx.send_notification(SessionNotification::new(
+                                session_id.clone(),
+                                SessionUpdate::ToolCallUpdate(update),
+                            ))?;
+                        }
+                    }
                 }
             }
         }
@@ -194,15 +244,14 @@ impl RhaiAgent {
                 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
                 use tokio::process::Command;
 
-                let transport = TokioChildProcess::new(
-                    Command::new(&stdio.command).configure(|cmd| {
+                let transport =
+                    TokioChildProcess::new(Command::new(&stdio.command).configure(|cmd| {
                         cmd.args(&stdio.args);
                         for env_var in &stdio.env {
                             cmd.env(&env_var.name, &env_var.value);
                         }
-                    }),
-                )
-                .map_err(|e| format!("Failed to spawn MCP server: {}", e))?;
+                    }))
+                    .map_err(|e| format!("Failed to spawn MCP server: {}", e))?;
 
                 let mcp_client = ()
                     .serve(transport)
@@ -273,15 +322,14 @@ impl RhaiAgent {
                 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
                 use tokio::process::Command;
 
-                let transport = TokioChildProcess::new(
-                    Command::new(&stdio.command).configure(|cmd| {
+                let transport =
+                    TokioChildProcess::new(Command::new(&stdio.command).configure(|cmd| {
                         cmd.args(&stdio.args);
                         for env_var in &stdio.env {
                             cmd.env(&env_var.name, &env_var.value);
                         }
-                    }),
-                )
-                .map_err(|e| format!("Failed to spawn MCP server: {}", e))?;
+                    }))
+                    .map_err(|e| format!("Failed to spawn MCP server: {}", e))?;
 
                 let mcp_client = ()
                     .serve(transport)
@@ -357,10 +405,7 @@ impl Default for RhaiAgent {
 }
 
 /// Run a Rhai script with the given message channel
-fn run_rhai_script(
-    script: &str,
-    msg_tx: mpsc::UnboundedSender<RhaiMessage>,
-) -> Result<(), String> {
+fn run_rhai_script(script: &str, msg_tx: mpsc::UnboundedSender<RhaiMessage>) -> Result<(), String> {
     let mut engine = Engine::new();
 
     // Register say() function
@@ -369,15 +414,23 @@ fn run_rhai_script(
         let _ = say_tx.send(RhaiMessage::Say(text.to_string()));
     });
 
+    // FIXME: In the future, could make this return a bool/error based on the results
+    // Register write_file(path, content)
+    let write_tx = msg_tx.clone();
+    engine.register_fn("write_file", move |path: &str, content: &str| {
+        let _ = write_tx.send(RhaiMessage::WriteFile {
+            path: path.to_string(),
+            content: content.to_string(),
+        });
+    });
+
     // Register mcp module
     let mcp_module = McpModule::new(msg_tx);
     let module: Module = mcp_module.into();
     engine.register_static_module("mcp", module.into());
 
     // Execute the script
-    engine
-        .run(script)
-        .map_err(|e| e.to_string())
+    engine.run(script).map_err(|e| e.to_string())
 }
 
 /// Extract text content from prompt blocks

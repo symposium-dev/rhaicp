@@ -4,8 +4,8 @@
 //! that the Rhai agent can call via `mcp::list_tools` and `mcp::call_tool`.
 
 use rhaicp::RhaiAgent;
-use sacp::mcp_server::McpServer;
 use sacp::link::AgentToClient;
+use sacp::mcp_server::McpServer;
 use sacp::{Component, ProxyToConductor};
 use sacp_conductor::{Conductor, ProxiesAndAgent};
 use schemars::JsonSchema;
@@ -261,7 +261,11 @@ async fn test_unknown_server_error() -> Result<(), sacp::Error> {
     .await?;
 
     // Should contain an error message about the server not being found
-    assert!(result.contains("ERROR"), "Expected error message, got: {}", result);
+    assert!(
+        result.contains("ERROR"),
+        "Expected error message, got: {}",
+        result
+    );
 
     Ok(())
 }
