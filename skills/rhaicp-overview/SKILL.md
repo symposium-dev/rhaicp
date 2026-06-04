@@ -1,3 +1,13 @@
+---
+name: rhaicp-overview
+description: >
+  Use rhaicp to build scripted ACP (agent-client-protocol) agents or clients
+  for integration testing. Activate when writing tests that need controllable
+  agent behavior, deterministic multi-turn conversations, session load/resume
+  with replay, or when configuring RhaiAgent/RhaiClient in a crate that
+  depends on rhaicp.
+---
+
 # rhaicp
 
 Use rhaicp to build scripted agent-client-protocol (ACP) agents or clients.
