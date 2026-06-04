@@ -3,76 +3,66 @@
 //! These tests use the conductor + proxy pattern to provide in-process MCP servers
 //! that the Rhai agent can call via `mcp::list_tools` and `mcp::call_tool`.
 
+mod support;
+
+use agent_client_protocol::mcp_server::McpServer;
+use agent_client_protocol::{Client, Conductor, ConnectTo, DynConnectTo, Proxy};
+use agent_client_protocol_conductor::{ConductorImpl, ProxiesAndAgent};
+use agent_client_protocol_polyfill::mcp_over_acp::McpOverAcpPolyfill;
+use agent_client_protocol_rmcp::McpServerExt;
 use rhaicp::RhaiAgent;
-use sacp::link::AgentToClient;
-use sacp::mcp_server::McpServer;
-use sacp::{Component, ProxyToConductor};
-use sacp_conductor::{Conductor, ProxiesAndAgent};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Wrapper to make RhaiAgent work with the test infrastructure
 struct TestRhaiAgent;
 
-impl Component<AgentToClient> for TestRhaiAgent {
-    async fn serve(
+impl ConnectTo<Client> for TestRhaiAgent {
+    async fn connect_to(
         self,
-        client: impl Component<sacp::link::ClientToAgent>,
-    ) -> Result<(), sacp::Error> {
-        Component::<AgentToClient>::serve(RhaiAgent::new(), client).await
+        client: impl ConnectTo<agent_client_protocol::Agent>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        RhaiAgent::new().connect_to(client).await
     }
 }
 
 /// Create a proxy that provides an echo MCP server
-fn create_echo_proxy() -> Result<sacp::DynComponent<ProxyToConductor>, sacp::Error> {
+fn create_echo_proxy() -> DynConnectTo<Conductor> {
     #[derive(Debug, Serialize, Deserialize, JsonSchema)]
     struct EchoInput {
         message: String,
     }
 
-    let mcp_server = McpServer::builder("echo")
+    let mcp_server = McpServer::<Conductor>::builder("echo")
         .instructions("Echo server for testing")
         .tool_fn(
             "echo",
             "Echoes back the input message",
-            async |input: EchoInput, _context| Ok(format!("Echo: {}", input.message)),
-            sacp::tool_fn!(),
+            async |input: EchoInput, _cx| Ok(format!("Echo: {}", input.message)),
+            agent_client_protocol_rmcp::tool_fn!(),
         )
         .build();
 
-    Ok(sacp::DynComponent::new(EchoProxy { mcp_server }))
-}
-
-struct EchoProxy<R: sacp::JrResponder<ProxyToConductor>> {
-    mcp_server: McpServer<ProxyToConductor, R>,
-}
-
-impl<R: sacp::JrResponder<ProxyToConductor> + 'static + Send> Component<ProxyToConductor>
-    for EchoProxy<R>
-{
-    async fn serve(
-        self,
-        client: impl Component<sacp::link::ConductorToProxy>,
-    ) -> Result<(), sacp::Error> {
-        ProxyToConductor::builder()
+    DynConnectTo::new(
+        Proxy
+            .builder()
             .name("echo-proxy")
-            .with_mcp_server(self.mcp_server)
-            .serve(client)
-            .await
-    }
+            .with_mcp_server(mcp_server),
+    )
 }
 
-fn conductor_with_echo() -> impl Component<AgentToClient> {
-    Conductor::new_agent(
-        "test-conductor".to_string(),
-        ProxiesAndAgent::new(TestRhaiAgent).proxy(create_echo_proxy().unwrap()),
-        Default::default(),
+fn conductor_with_echo() -> impl ConnectTo<Client> {
+    ConductorImpl::new_agent(
+        "test-conductor",
+        ProxiesAndAgent::new(TestRhaiAgent)
+            .proxy(create_echo_proxy())
+            .proxy(McpOverAcpPolyfill::http()),
     )
 }
 
 #[tokio::test]
-async fn test_list_tools() -> Result<(), sacp::Error> {
-    let result = yopo::prompt(
+async fn test_list_tools() -> Result<(), agent_client_protocol::Error> {
+    let result = support::prompt(
         conductor_with_echo(),
         r#"
         let tools = mcp::list_tools("echo");
@@ -92,8 +82,8 @@ async fn test_list_tools() -> Result<(), sacp::Error> {
 }
 
 #[tokio::test]
-async fn test_call_tool() -> Result<(), sacp::Error> {
-    let result = yopo::prompt(
+async fn test_call_tool() -> Result<(), agent_client_protocol::Error> {
+    let result = support::prompt(
         conductor_with_echo(),
         r#"
         let result = mcp::call_tool("echo", "echo", #{ message: "Hello from Rhai!" });
@@ -111,7 +101,7 @@ async fn test_call_tool() -> Result<(), sacp::Error> {
 }
 
 /// Create a proxy with a calculator MCP server for more complex tool testing
-fn create_calculator_proxy() -> Result<sacp::DynComponent<ProxyToConductor>, sacp::Error> {
+fn create_calculator_proxy() -> DynConnectTo<Conductor> {
     #[derive(Debug, Serialize, Deserialize, JsonSchema)]
     struct AddInput {
         a: i64,
@@ -124,55 +114,42 @@ fn create_calculator_proxy() -> Result<sacp::DynComponent<ProxyToConductor>, sac
         b: i64,
     }
 
-    let mcp_server = McpServer::builder("calc")
+    let mcp_server = McpServer::<Conductor>::builder("calc")
         .instructions("Calculator server for testing")
         .tool_fn(
             "add",
             "Add two numbers",
-            async |input: AddInput, _context| Ok(input.a + input.b),
-            sacp::tool_fn!(),
+            async |input: AddInput, _cx| Ok(input.a + input.b),
+            agent_client_protocol_rmcp::tool_fn!(),
         )
         .tool_fn(
             "multiply",
             "Multiply two numbers",
-            async |input: MultiplyInput, _context| Ok(input.a * input.b),
-            sacp::tool_fn!(),
+            async |input: MultiplyInput, _cx| Ok(input.a * input.b),
+            agent_client_protocol_rmcp::tool_fn!(),
         )
         .build();
 
-    Ok(sacp::DynComponent::new(CalculatorProxy { mcp_server }))
-}
-
-struct CalculatorProxy<R: sacp::JrResponder<ProxyToConductor>> {
-    mcp_server: McpServer<ProxyToConductor, R>,
-}
-
-impl<R: sacp::JrResponder<ProxyToConductor> + 'static + Send> Component<ProxyToConductor>
-    for CalculatorProxy<R>
-{
-    async fn serve(
-        self,
-        client: impl Component<sacp::link::ConductorToProxy>,
-    ) -> Result<(), sacp::Error> {
-        ProxyToConductor::builder()
+    DynConnectTo::new(
+        Proxy
+            .builder()
             .name("calc-proxy")
-            .with_mcp_server(self.mcp_server)
-            .serve(client)
-            .await
-    }
+            .with_mcp_server(mcp_server),
+    )
 }
 
-fn conductor_with_calc() -> impl Component<AgentToClient> {
-    Conductor::new_agent(
-        "test-conductor".to_string(),
-        ProxiesAndAgent::new(TestRhaiAgent).proxy(create_calculator_proxy().unwrap()),
-        Default::default(),
+fn conductor_with_calc() -> impl ConnectTo<Client> {
+    ConductorImpl::new_agent(
+        "test-conductor",
+        ProxiesAndAgent::new(TestRhaiAgent)
+            .proxy(create_calculator_proxy())
+            .proxy(McpOverAcpPolyfill::http()),
     )
 }
 
 #[tokio::test]
-async fn test_list_multiple_tools() -> Result<(), sacp::Error> {
-    let result = yopo::prompt(
+async fn test_list_multiple_tools() -> Result<(), agent_client_protocol::Error> {
+    let result = support::prompt(
         conductor_with_calc(),
         r#"
         let tools = mcp::list_tools("calc");
@@ -190,8 +167,8 @@ async fn test_list_multiple_tools() -> Result<(), sacp::Error> {
 }
 
 #[tokio::test]
-async fn test_call_add_tool() -> Result<(), sacp::Error> {
-    let result = yopo::prompt(
+async fn test_call_add_tool() -> Result<(), agent_client_protocol::Error> {
+    let result = support::prompt(
         conductor_with_calc(),
         r#"
         let result = mcp::call_tool("calc", "add", #{ a: 3, b: 5 });
@@ -209,8 +186,8 @@ async fn test_call_add_tool() -> Result<(), sacp::Error> {
 }
 
 #[tokio::test]
-async fn test_call_multiply_tool() -> Result<(), sacp::Error> {
-    let result = yopo::prompt(
+async fn test_call_multiply_tool() -> Result<(), agent_client_protocol::Error> {
+    let result = support::prompt(
         conductor_with_calc(),
         r#"
         let result = mcp::call_tool("calc", "multiply", #{ a: 7, b: 6 });
@@ -228,8 +205,8 @@ async fn test_call_multiply_tool() -> Result<(), sacp::Error> {
 }
 
 #[tokio::test]
-async fn test_chain_tool_calls() -> Result<(), sacp::Error> {
-    let result = yopo::prompt(
+async fn test_chain_tool_calls() -> Result<(), agent_client_protocol::Error> {
+    let result = support::prompt(
         conductor_with_calc(),
         r#"
         // Calculate (3 + 5) * 2 = 16
@@ -250,8 +227,8 @@ async fn test_chain_tool_calls() -> Result<(), sacp::Error> {
 }
 
 #[tokio::test]
-async fn test_unknown_server_error() -> Result<(), sacp::Error> {
-    let result = yopo::prompt(
+async fn test_unknown_server_error() -> Result<(), agent_client_protocol::Error> {
+    let result = support::prompt(
         conductor_with_echo(),
         r#"
         let tools = mcp::list_tools("nonexistent");
@@ -273,79 +250,56 @@ async fn test_unknown_server_error() -> Result<(), sacp::Error> {
 // =============================================================================
 // Structured vs Unstructured Content Tests
 // =============================================================================
-//
-// MCP tools can return results in two ways:
-// 1. Structured content: When a tool returns a struct type, the result includes
-//    `structured_content` with the JSON value directly.
-// 2. Unstructured content: When a tool returns a primitive type (String, i64, etc.),
-//    the result is serialized to text in the `content` array.
-//
-// The tests above (echo, add, multiply) all use unstructured content because they
-// return primitive types. The tests below explicitly test both paths.
 
 /// Create a proxy with a tool that returns a struct (structured content)
-fn create_structured_proxy() -> Result<sacp::DynComponent<ProxyToConductor>, sacp::Error> {
+fn create_structured_proxy() -> DynConnectTo<Conductor> {
     #[derive(Debug, Serialize, Deserialize, JsonSchema)]
     struct GetUserInput {
         id: i64,
     }
 
-    /// User info - returning a struct triggers structured content
     #[derive(Debug, Serialize, Deserialize, JsonSchema)]
     struct UserInfo {
         name: String,
         age: i64,
     }
 
-    let mcp_server = McpServer::builder("users")
+    let mcp_server = McpServer::<Conductor>::builder("users")
         .instructions("User info server for testing structured content")
         .tool_fn(
             "get_user",
             "Get user info by ID",
-            async |input: GetUserInput, _context| {
+            async |input: GetUserInput, _cx| {
                 Ok(UserInfo {
                     name: format!("User{}", input.id),
                     age: 20 + input.id,
                 })
             },
-            sacp::tool_fn!(),
+            agent_client_protocol_rmcp::tool_fn!(),
         )
         .build();
 
-    Ok(sacp::DynComponent::new(StructuredProxy { mcp_server }))
-}
-
-struct StructuredProxy<R: sacp::JrResponder<ProxyToConductor>> {
-    mcp_server: McpServer<ProxyToConductor, R>,
-}
-
-impl<R: sacp::JrResponder<ProxyToConductor> + 'static + Send> Component<ProxyToConductor>
-    for StructuredProxy<R>
-{
-    async fn serve(
-        self,
-        client: impl Component<sacp::link::ConductorToProxy>,
-    ) -> Result<(), sacp::Error> {
-        ProxyToConductor::builder()
+    DynConnectTo::new(
+        Proxy
+            .builder()
             .name("structured-proxy")
-            .with_mcp_server(self.mcp_server)
-            .serve(client)
-            .await
-    }
+            .with_mcp_server(mcp_server),
+    )
 }
 
-fn conductor_with_structured() -> impl Component<AgentToClient> {
-    Conductor::new_agent(
-        "test-conductor".to_string(),
-        ProxiesAndAgent::new(TestRhaiAgent).proxy(create_structured_proxy().unwrap()),
-        Default::default(),
+fn conductor_with_structured() -> impl ConnectTo<Client> {
+    ConductorImpl::new_agent(
+        "test-conductor",
+        ProxiesAndAgent::new(TestRhaiAgent)
+            .proxy(create_structured_proxy())
+            .proxy(McpOverAcpPolyfill::http()),
     )
 }
 
 /// Test structured content: tool returns a struct, result has `structured_content`
 #[tokio::test]
-async fn test_structured_content_returns_object() -> Result<(), sacp::Error> {
-    let result = yopo::prompt(
+async fn test_structured_content_returns_object() -> Result<(), agent_client_protocol::Error> {
+    let result = support::prompt(
         conductor_with_structured(),
         r#"
         let user = mcp::call_tool("users", "get_user", #{ id: 42 });
@@ -364,13 +318,10 @@ async fn test_structured_content_returns_object() -> Result<(), sacp::Error> {
 }
 
 /// Test unstructured content: tool returns a primitive, text content is parsed as JSON
-/// This test documents that primitive return types (like i64) go through the unstructured
-/// path where the value is serialized to text, then parsed back as JSON to preserve types.
 #[tokio::test]
-async fn test_unstructured_content_preserves_number_types() -> Result<(), sacp::Error> {
-    // The add tool returns i64, which uses unstructured content (text serialization)
-    // Our extract_tool_result tries to parse the text as JSON to preserve the number type
-    let result = yopo::prompt(
+async fn test_unstructured_content_preserves_number_types(
+) -> Result<(), agent_client_protocol::Error> {
+    let result = support::prompt(
         conductor_with_calc(),
         r#"
         let sum = mcp::call_tool("calc", "add", #{ a: 100, b: 200 });
@@ -390,10 +341,9 @@ async fn test_unstructured_content_preserves_number_types() -> Result<(), sacp::
 }
 
 /// Test unstructured content: tool returns a string
-/// Strings that aren't valid JSON are returned as-is.
 #[tokio::test]
-async fn test_unstructured_content_returns_string() -> Result<(), sacp::Error> {
-    let result = yopo::prompt(
+async fn test_unstructured_content_returns_string() -> Result<(), agent_client_protocol::Error> {
+    let result = support::prompt(
         conductor_with_echo(),
         r#"
         let msg = mcp::call_tool("echo", "echo", #{ message: "test" });

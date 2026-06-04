@@ -1,15 +1,15 @@
 mod mcp_module;
 
-use anyhow::Result;
-use mcp_module::McpModule;
-use rhai::{Engine, Module};
-use sacp::schema::{
+use agent_client_protocol::schema::{
     AgentCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
     LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse,
     PromptRequest, PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason,
     TextContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
-use sacp::{AgentToClient, Component, JrConnectionCx, JrRequestCx};
+use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, Responder};
+use anyhow::Result;
+use mcp_module::McpModule;
+use rhai::{Engine, Module};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -71,35 +71,35 @@ impl RhaiAgent {
     async fn handle_new_session(
         &self,
         request: NewSessionRequest,
-        request_cx: JrRequestCx<NewSessionResponse>,
-    ) -> Result<(), sacp::Error> {
+        responder: Responder<NewSessionResponse>,
+    ) -> Result<(), agent_client_protocol::Error> {
         tracing::debug!("New session request with cwd: {:?}", request.cwd);
 
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
         self.create_session(&session_id, request.mcp_servers);
 
-        request_cx.respond(NewSessionResponse::new(session_id))
+        responder.respond(NewSessionResponse::new(session_id))
     }
 
     async fn handle_load_session(
         &self,
         request: LoadSessionRequest,
-        request_cx: JrRequestCx<LoadSessionResponse>,
-    ) -> Result<(), sacp::Error> {
+        responder: Responder<LoadSessionResponse>,
+    ) -> Result<(), agent_client_protocol::Error> {
         tracing::debug!("Load session request: {:?}", request.session_id);
 
         self.create_session(&request.session_id, vec![]);
 
-        request_cx.respond(LoadSessionResponse::new())
+        responder.respond(LoadSessionResponse::new())
     }
 
     /// Process the prompt by executing it as a Rhai script
     async fn process_prompt(
         &self,
         request: PromptRequest,
-        request_cx: JrRequestCx<PromptResponse>,
-        cx: JrConnectionCx<AgentToClient>,
-    ) -> Result<(), sacp::Error> {
+        responder: Responder<PromptResponse>,
+        cx: ConnectionTo<Client>,
+    ) -> Result<(), agent_client_protocol::Error> {
         let session_id = request.session_id.clone();
 
         // Extract the Rhai script from the prompt
@@ -219,7 +219,7 @@ impl RhaiAgent {
             }
         }
 
-        request_cx.respond(PromptResponse::new(StopReason::EndTurn))
+        responder.respond(PromptResponse::new(StopReason::EndTurn))
     }
 
     async fn list_tools_async(
@@ -387,8 +387,6 @@ fn extract_tool_result(result: rmcp::model::CallToolResult) -> Result<serde_json
     // Fall back to first text content
     if let Some(content) = result.content.first() {
         if let Some(text_content) = content.as_text() {
-            // Try parsing as JSON to preserve types (numbers, booleans, objects, etc.)
-            // If that fails, return as a plain string
             return Ok(serde_json::from_str(&text_content.text)
                 .unwrap_or_else(|_| serde_json::Value::String(text_content.text.clone())));
         }
@@ -449,7 +447,6 @@ fn extract_text_from_prompt(blocks: &[ContentBlock]) -> String {
 /// If the text contains `<userRequest>...</userRequest>`, extract that content
 /// Otherwise, treat the entire text as a Rhai script
 fn extract_rhai_script(input: &str) -> String {
-    // Try to extract from <userRequest> tags
     if let Some(start) = input.find("<userRequest>") {
         if let Some(end) = input.find("</userRequest>") {
             let content_start = start + "<userRequest>".len();
@@ -463,57 +460,59 @@ fn extract_rhai_script(input: &str) -> String {
     input.trim().to_string()
 }
 
-impl Component<sacp::link::AgentToClient> for RhaiAgent {
-    async fn serve(
+impl ConnectTo<Client> for RhaiAgent {
+    async fn connect_to(
         self,
-        client: impl Component<sacp::link::ClientToAgent>,
-    ) -> Result<(), sacp::Error> {
-        AgentToClient::builder()
+        client: impl ConnectTo<Agent>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        Agent
+            .builder()
             .name("rhaicp")
             .on_receive_request(
-                async |initialize: InitializeRequest, request_cx, _cx| {
+                async |initialize: InitializeRequest, responder, _cx| {
                     tracing::debug!("Received initialize request");
 
-                    request_cx.respond(
+                    responder.respond(
                         InitializeResponse::new(initialize.protocol_version)
                             .agent_capabilities(AgentCapabilities::new()),
                     )
                 },
-                sacp::on_receive_request!(),
+                agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
                 {
                     let agent = self.clone();
-                    async move |request: NewSessionRequest, request_cx, _cx| {
-                        agent.handle_new_session(request, request_cx).await
+                    async move |request: NewSessionRequest, responder, _cx| {
+                        agent.handle_new_session(request, responder).await
                     }
                 },
-                sacp::on_receive_request!(),
+                agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
                 {
                     let agent = self.clone();
-                    async move |request: LoadSessionRequest, request_cx, _cx| {
-                        agent.handle_load_session(request, request_cx).await
+                    async move |request: LoadSessionRequest, responder, _cx| {
+                        agent.handle_load_session(request, responder).await
                     }
                 },
-                sacp::on_receive_request!(),
+                agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
                 {
                     let agent = self.clone();
-                    async move |request: PromptRequest, request_cx, cx| {
-                        let cx_clone = cx.clone();
+                    async move |request: PromptRequest, responder, cx| {
                         cx.spawn({
                             let agent = agent.clone();
-                            async move { agent.process_prompt(request, request_cx, cx_clone).await }
+                            let cx_clone = cx.clone();
+                            async move {
+                                agent.process_prompt(request, responder, cx_clone).await
+                            }
                         })
                     }
                 },
-                sacp::on_receive_request!(),
+                agent_client_protocol::on_receive_request!(),
             )
-            .connect_to(client)?
-            .serve()
+            .connect_to(client)
             .await
     }
 }

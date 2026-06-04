@@ -10,9 +10,9 @@
 //! - Exposes `mcp::list_tools(server)` and `mcp::call_tool(server, tool, args)` for MCP access
 
 use anyhow::Result;
+use agent_client_protocol::ConnectTo;
 use clap::Parser;
 use rhaicp::RhaiAgent;
-use sacp::Component;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -55,7 +55,9 @@ async fn main() -> Result<()> {
     match args.command {
         Command::Acp => {
             tracing::info!("Rhaicp starting");
-            RhaiAgent::new().serve(sacp_tokio::Stdio::new()).await?;
+            RhaiAgent::new()
+                .connect_to(agent_client_protocol::Stdio::new())
+                .await?;
         }
     }
 
