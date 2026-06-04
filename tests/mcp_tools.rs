@@ -319,8 +319,8 @@ async fn test_structured_content_returns_object() -> Result<(), agent_client_pro
 
 /// Test unstructured content: tool returns a primitive, text content is parsed as JSON
 #[tokio::test]
-async fn test_unstructured_content_preserves_number_types(
-) -> Result<(), agent_client_protocol::Error> {
+async fn test_unstructured_content_preserves_number_types()
+-> Result<(), agent_client_protocol::Error> {
     let result = support::prompt(
         conductor_with_calc(),
         r#"

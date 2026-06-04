@@ -9,10 +9,13 @@
 //! - Exposes `say(text)` to stream responses back to the client
 //! - Exposes `mcp::list_tools(server)` and `mcp::call_tool(server, tool, args)` for MCP access
 
+use std::path::PathBuf;
+
+use agent_client_protocol::{AcpAgent, ConnectTo};
 use anyhow::Result;
-use agent_client_protocol::ConnectTo;
 use clap::Parser;
 use rhaicp::RhaiAgent;
+use rhaicp::client::RhaiClient;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -30,6 +33,15 @@ struct Args {
 enum Command {
     /// Run as ACP agent over stdio
     Acp,
+    /// Run a Rhai script as a client against an external agent
+    Client {
+        /// Path to the Rhai script file
+        #[arg(short, long)]
+        script: PathBuf,
+        /// The agent command to run (everything after --)
+        #[arg(last = true, required = true)]
+        agent_cmd: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -58,6 +70,29 @@ async fn main() -> Result<()> {
             RhaiAgent::new()
                 .connect_to(agent_client_protocol::Stdio::new())
                 .await?;
+        }
+        Command::Client { script, agent_cmd } => {
+            let script_content = std::fs::read_to_string(&script)
+                .map_err(|e| anyhow::anyhow!("Failed to read script {:?}: {}", script, e))?;
+
+            let cmd_str = agent_cmd.join(" ");
+            let agent: AcpAgent = cmd_str
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse agent command: {}", e))?;
+
+            let result = RhaiClient::new().execute(agent, &script_content).await;
+
+            match result {
+                Ok(output) => {
+                    if !output.is_empty() {
+                        println!("{output}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 

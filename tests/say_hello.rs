@@ -72,8 +72,7 @@ async fn test_user_request_extraction() -> Result<(), agent_client_protocol::Err
 
 #[tokio::test]
 async fn test_rhai_error_handling() -> Result<(), agent_client_protocol::Error> {
-    let result =
-        support::prompt(conductor(), r#"this is not valid rhai syntax {"#).await?;
+    let result = support::prompt(conductor(), r#"this is not valid rhai syntax {"#).await?;
 
     expect_test::expect![[r#"
         "Rhai error: Syntax error: 'this' can only be used in functions (line 1, position 1)"

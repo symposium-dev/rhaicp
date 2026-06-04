@@ -1,3 +1,4 @@
+pub mod client;
 mod mcp_module;
 
 use agent_client_protocol::schema::{
@@ -36,6 +37,7 @@ pub enum RhaiMessage {
 
 /// Session data for each active session
 struct SessionData {
+    cwd: String,
     mcp_servers: Vec<McpServer>,
 }
 
@@ -52,10 +54,10 @@ impl RhaiAgent {
         }
     }
 
-    fn create_session(&self, session_id: &SessionId, mcp_servers: Vec<McpServer>) {
+    fn create_session(&self, session_id: &SessionId, cwd: String, mcp_servers: Vec<McpServer>) {
         let mcp_server_count = mcp_servers.len();
         let mut sessions = self.sessions.lock().unwrap();
-        sessions.insert(session_id.clone(), SessionData { mcp_servers });
+        sessions.insert(session_id.clone(), SessionData { cwd, mcp_servers });
         tracing::info!(
             "Created session: {} with {} MCP servers",
             session_id,
@@ -63,9 +65,11 @@ impl RhaiAgent {
         );
     }
 
-    fn get_mcp_servers(&self, session_id: &SessionId) -> Option<Vec<McpServer>> {
+    fn get_session_data(&self, session_id: &SessionId) -> Option<(String, Vec<McpServer>)> {
         let sessions = self.sessions.lock().unwrap();
-        sessions.get(session_id).map(|s| s.mcp_servers.clone())
+        sessions
+            .get(session_id)
+            .map(|s| (s.cwd.clone(), s.mcp_servers.clone()))
     }
 
     async fn handle_new_session(
@@ -75,8 +79,9 @@ impl RhaiAgent {
     ) -> Result<(), agent_client_protocol::Error> {
         tracing::debug!("New session request with cwd: {:?}", request.cwd);
 
+        let cwd = request.cwd.to_string_lossy().to_string();
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-        self.create_session(&session_id, request.mcp_servers);
+        self.create_session(&session_id, cwd, request.mcp_servers);
 
         responder.respond(NewSessionResponse::new(session_id))
     }
@@ -88,7 +93,7 @@ impl RhaiAgent {
     ) -> Result<(), agent_client_protocol::Error> {
         tracing::debug!("Load session request: {:?}", request.session_id);
 
-        self.create_session(&request.session_id, vec![]);
+        self.create_session(&request.session_id, String::new(), vec![]);
 
         responder.respond(LoadSessionResponse::new())
     }
@@ -112,8 +117,8 @@ impl RhaiAgent {
             script
         );
 
-        // Get MCP servers for this session
-        let mcp_servers = self.get_mcp_servers(&session_id).unwrap_or_default();
+        // Get session data
+        let (cwd, mcp_servers) = self.get_session_data(&session_id).unwrap_or_default();
 
         // Create channel for Rhai -> async communication
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<RhaiMessage>();
@@ -121,7 +126,7 @@ impl RhaiAgent {
         // Spawn blocking task to run Rhai
         let script_clone = script.clone();
         let rhai_handle =
-            tokio::task::spawn_blocking(move || run_rhai_script(&script_clone, msg_tx));
+            tokio::task::spawn_blocking(move || run_rhai_script(&script_clone, msg_tx, &cwd));
 
         // Process messages from Rhai execution
         while let Some(msg) = msg_rx.recv().await {
@@ -401,8 +406,16 @@ impl Default for RhaiAgent {
 }
 
 /// Run a Rhai script with the given message channel
-fn run_rhai_script(script: &str, msg_tx: mpsc::UnboundedSender<RhaiMessage>) -> Result<(), String> {
+fn run_rhai_script(
+    script: &str,
+    msg_tx: mpsc::UnboundedSender<RhaiMessage>,
+    cwd: &str,
+) -> Result<(), String> {
     let mut engine = Engine::new();
+
+    // Register cwd() function
+    let cwd_value = cwd.to_string();
+    engine.register_fn("cwd", move || -> String { cwd_value.clone() });
 
     // Register say() function
     let say_tx = msg_tx.clone();
@@ -500,9 +513,7 @@ impl ConnectTo<Client> for RhaiAgent {
                         cx.spawn({
                             let agent = agent.clone();
                             let cx_clone = cx.clone();
-                            async move {
-                                agent.process_prompt(request, responder, cx_clone).await
-                            }
+                            async move { agent.process_prompt(request, responder, cx_clone).await }
                         })
                     }
                 },
