@@ -818,6 +818,14 @@ fn register_common_functions(
         });
     });
 
+    engine.register_fn("sleep", |ms: i64| {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    });
+
+    engine.register_fn("exit", |code: i64| {
+        std::process::exit(code as i32);
+    });
+
     let mcp_module = McpModule::new(msg_tx);
     let module: Module = mcp_module.into();
     engine.register_static_module("mcp", module.into());

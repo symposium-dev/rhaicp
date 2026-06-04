@@ -448,6 +448,11 @@ fn run_client_script(
         },
     );
 
+    // Register sleep(ms)
+    engine.register_fn("sleep", |ms: i64| {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    });
+
     // Register session.session_id() -> String
     engine.register_fn("session_id", |session: &mut SessionHandle| -> String {
         session.session_id.clone()
