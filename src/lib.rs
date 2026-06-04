@@ -3,8 +3,9 @@ mod mcp_module;
 
 use agent_client_protocol::schema::{
     AgentCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ResumeSessionRequest,
+    ResumeSessionResponse, SessionId, SessionInfo, SessionNotification, SessionUpdate, StopReason,
     TextContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, Responder};
@@ -12,6 +13,7 @@ use anyhow::Result;
 use mcp_module::McpModule;
 use rhai::{Engine, Module};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -19,6 +21,8 @@ use tokio::sync::mpsc;
 pub enum RhaiMessage {
     /// Send text to the client via `say()`
     Say(String),
+    /// Send a user message chunk (for replay)
+    UserMessage(String),
     /// List tools from an MCP server
     ListTools {
         server: String,
@@ -33,6 +37,17 @@ pub enum RhaiMessage {
     },
     /// Write a file on disk
     WriteFile { path: String, content: String },
+    /// Script is ready to receive a prompt (blocks until one arrives)
+    ReceivePrompt {
+        response_tx: std::sync::mpsc::Sender<String>,
+    },
+}
+
+/// Configuration for a prior session known at startup.
+#[derive(Clone)]
+pub struct PriorSession {
+    pub session_id: SessionId,
+    pub script: String,
 }
 
 /// Session data for each active session
@@ -41,17 +56,40 @@ struct SessionData {
     mcp_servers: Vec<McpServer>,
 }
 
+/// State for a scripted session (one running a long-lived script with receive_prompt())
+struct ScriptedSession {
+    prompt_tx: Option<std::sync::mpsc::Sender<String>>,
+}
+
 /// Rhai scripting ACP agent
 #[derive(Clone)]
 pub struct RhaiAgent {
     sessions: Arc<Mutex<HashMap<SessionId, SessionData>>>,
+    prior_sessions: Arc<Vec<PriorSession>>,
+    new_session_script: Arc<Option<String>>,
+    scripted_sessions: Arc<Mutex<HashMap<SessionId, ScriptedSession>>>,
+    msg_receivers: Arc<Mutex<HashMap<SessionId, mpsc::UnboundedReceiver<RhaiMessage>>>>,
 }
 
 impl RhaiAgent {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            prior_sessions: Arc::new(Vec::new()),
+            new_session_script: Arc::new(None),
+            scripted_sessions: Arc::new(Mutex::new(HashMap::new())),
+            msg_receivers: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn prior_sessions(mut self, sessions: Vec<PriorSession>) -> Self {
+        self.prior_sessions = Arc::new(sessions);
+        self
+    }
+
+    pub fn new_session_script(mut self, script: String) -> Self {
+        self.new_session_script = Arc::new(Some(script));
+        self
     }
 
     fn create_session(&self, session_id: &SessionId, cwd: String, mcp_servers: Vec<McpServer>) {
@@ -76,12 +114,18 @@ impl RhaiAgent {
         &self,
         request: NewSessionRequest,
         responder: Responder<NewSessionResponse>,
+        cx: ConnectionTo<Client>,
     ) -> Result<(), agent_client_protocol::Error> {
         tracing::debug!("New session request with cwd: {:?}", request.cwd);
 
         let cwd = request.cwd.to_string_lossy().to_string();
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
         self.create_session(&session_id, cwd, request.mcp_servers);
+
+        if let Some(script) = self.new_session_script.as_ref() {
+            self.start_scripted_session(session_id.clone(), script.clone(), false, &cx)?;
+            self.drain_replay_messages(&session_id, &cx).await?;
+        }
 
         responder.respond(NewSessionResponse::new(session_id))
     }
@@ -90,15 +134,193 @@ impl RhaiAgent {
         &self,
         request: LoadSessionRequest,
         responder: Responder<LoadSessionResponse>,
+        cx: ConnectionTo<Client>,
     ) -> Result<(), agent_client_protocol::Error> {
-        tracing::debug!("Load session request: {:?}", request.session_id);
+        let session_id = &request.session_id;
+        tracing::debug!("Load session request: {:?}", session_id);
 
-        self.create_session(&request.session_id, String::new(), vec![]);
+        self.create_session(session_id, String::new(), vec![]);
+
+        if let Some(prior) = self
+            .prior_sessions
+            .iter()
+            .find(|p| &p.session_id == session_id)
+        {
+            let script = prior.script.clone();
+            self.start_scripted_session(session_id.clone(), script, true, &cx)?;
+
+            // Process replay messages until the script hits receive_prompt() or finishes
+            self.drain_replay_messages(session_id, &cx).await?;
+        }
 
         responder.respond(LoadSessionResponse::new())
     }
 
-    /// Process the prompt by executing it as a Rhai script
+    async fn handle_resume_session(
+        &self,
+        request: ResumeSessionRequest,
+        responder: Responder<ResumeSessionResponse>,
+        cx: ConnectionTo<Client>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let session_id = &request.session_id;
+        tracing::debug!("Resume session request: {:?}", session_id);
+
+        self.create_session(
+            session_id,
+            request.cwd.to_string_lossy().to_string(),
+            request.mcp_servers,
+        );
+
+        if let Some(prior) = self
+            .prior_sessions
+            .iter()
+            .find(|p| &p.session_id == session_id)
+        {
+            let script = prior.script.clone();
+            // is_load = false for resume, so the script can skip replay
+            self.start_scripted_session(session_id.clone(), script, false, &cx)?;
+
+            // Still drain any messages the script emits before receive_prompt()
+            self.drain_replay_messages(session_id, &cx).await?;
+        }
+
+        responder.respond(ResumeSessionResponse::new())
+    }
+
+    fn handle_list_sessions(
+        &self,
+        _request: ListSessionsRequest,
+        responder: Responder<ListSessionsResponse>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let sessions: Vec<SessionInfo> = self
+            .prior_sessions
+            .iter()
+            .map(|p| SessionInfo::new(p.session_id.clone(), PathBuf::from("/")))
+            .collect();
+
+        responder.respond(ListSessionsResponse::new(sessions))
+    }
+
+    /// Start a scripted session: spawn a blocking task running the script.
+    /// The script can call receive_prompt() to block until a prompt arrives.
+    fn start_scripted_session(
+        &self,
+        session_id: SessionId,
+        script: String,
+        is_load: bool,
+        _cx: &ConnectionTo<Client>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<RhaiMessage>();
+
+        let cwd = self
+            .get_session_data(&session_id)
+            .map(|(cwd, _)| cwd)
+            .unwrap_or_default();
+
+        let msg_tx_clone = msg_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            run_scripted_session(&script, msg_tx_clone, &cwd, is_load);
+        });
+
+        drop(msg_tx);
+        self.scripted_sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), ScriptedSession { prompt_tx: None });
+
+        self.msg_receivers
+            .lock()
+            .unwrap()
+            .insert(session_id, msg_rx);
+
+        Ok(())
+    }
+
+    /// Drain replay messages from the scripted session until it blocks on receive_prompt()
+    /// or finishes.
+    async fn drain_replay_messages(
+        &self,
+        session_id: &SessionId,
+        cx: &ConnectionTo<Client>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let mut msg_rx = {
+            let mut receivers = self.msg_receivers.lock().unwrap();
+            match receivers.remove(session_id) {
+                Some(rx) => rx,
+                None => return Ok(()),
+            }
+        };
+
+        loop {
+            // Use try_recv in a loop with a small yield to avoid holding the lock
+            match msg_rx.recv().await {
+                Some(RhaiMessage::Say(text)) => {
+                    cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(text.into())),
+                    ))?;
+                }
+                Some(RhaiMessage::UserMessage(text)) => {
+                    cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::UserMessageChunk(ContentChunk::new(text.into())),
+                    ))?;
+                }
+                Some(RhaiMessage::ReceivePrompt { response_tx }) => {
+                    // Script is blocked waiting for a prompt. Store the channel and the receiver.
+                    let mut scripted = self.scripted_sessions.lock().unwrap();
+                    if let Some(ss) = scripted.get_mut(session_id) {
+                        ss.prompt_tx = Some(response_tx);
+                    }
+                    // Put the receiver back for future prompt processing
+                    let mut receivers = self.msg_receivers.lock().unwrap();
+                    receivers.insert(session_id.clone(), msg_rx);
+                    return Ok(());
+                }
+                Some(RhaiMessage::WriteFile { path, content }) => {
+                    let write_result = tokio::fs::write(&path, &content).await;
+                    let update = match write_result {
+                        Ok(()) => ToolCallUpdate::new(
+                            "write_file_id",
+                            ToolCallUpdateFields::new()
+                                .status(ToolCallStatus::Completed)
+                                .locations(vec![ToolCallLocation::new(path)])
+                                .content(vec![
+                                    ContentBlock::Text(TextContent::new("Finished writing file."))
+                                        .into(),
+                                ]),
+                        ),
+                        Err(e) => ToolCallUpdate::new(
+                            "write_file_id",
+                            ToolCallUpdateFields::new()
+                                .status(ToolCallStatus::Failed)
+                                .locations(vec![ToolCallLocation::new(path)])
+                                .content(vec![
+                                    ContentBlock::Text(TextContent::new(format!("{:?}", e))).into(),
+                                ]),
+                        ),
+                    };
+                    cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::ToolCallUpdate(update),
+                    ))?;
+                }
+                Some(RhaiMessage::ListTools { response_tx, .. }) => {
+                    let _ = response_tx.send(Err("MCP not available during replay".to_string()));
+                }
+                Some(RhaiMessage::CallTool { response_tx, .. }) => {
+                    let _ = response_tx.send(Err("MCP not available during replay".to_string()));
+                }
+                None => {
+                    // Script finished without calling receive_prompt()
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Process the prompt by executing it as a Rhai script (relay mode)
+    /// or forwarding to a scripted session.
     async fn process_prompt(
         &self,
         request: PromptRequest,
@@ -107,7 +329,134 @@ impl RhaiAgent {
     ) -> Result<(), agent_client_protocol::Error> {
         let session_id = request.session_id.clone();
 
-        // Extract the Rhai script from the prompt
+        // Check if there's a scripted session waiting for a prompt
+        let prompt_tx = {
+            let mut scripted = self.scripted_sessions.lock().unwrap();
+            scripted
+                .get_mut(&session_id)
+                .and_then(|ss| ss.prompt_tx.take())
+        };
+
+        if let Some(prompt_tx) = prompt_tx {
+            // Forward the prompt text to the blocked script
+            let input_text = extract_text_from_prompt(&request.prompt);
+            let _ = prompt_tx.send(input_text);
+
+            // Now drain messages until the script hits receive_prompt() again or finishes
+            self.process_scripted_prompt(&session_id, responder, &cx)
+                .await
+        } else {
+            // Relay mode: execute the prompt text as a Rhai script
+            self.process_relay_prompt(request, responder, cx).await
+        }
+    }
+
+    /// Process messages from a scripted session after a prompt was delivered.
+    async fn process_scripted_prompt(
+        &self,
+        session_id: &SessionId,
+        responder: Responder<PromptResponse>,
+        cx: &ConnectionTo<Client>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let mut msg_rx = {
+            let mut receivers = self.msg_receivers.lock().unwrap();
+            match receivers.remove(session_id) {
+                Some(rx) => rx,
+                None => return responder.respond(PromptResponse::new(StopReason::EndTurn)),
+            }
+        };
+
+        let mcp_servers = self
+            .get_session_data(session_id)
+            .map(|(_, servers)| servers)
+            .unwrap_or_default();
+
+        loop {
+            match msg_rx.recv().await {
+                Some(RhaiMessage::Say(text)) => {
+                    cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(text.into())),
+                    ))?;
+                }
+                Some(RhaiMessage::UserMessage(text)) => {
+                    cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::UserMessageChunk(ContentChunk::new(text.into())),
+                    ))?;
+                }
+                Some(RhaiMessage::ReceivePrompt { response_tx }) => {
+                    let mut scripted = self.scripted_sessions.lock().unwrap();
+                    if let Some(ss) = scripted.get_mut(session_id) {
+                        ss.prompt_tx = Some(response_tx);
+                    }
+                    let mut receivers = self.msg_receivers.lock().unwrap();
+                    receivers.insert(session_id.clone(), msg_rx);
+                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                }
+                Some(RhaiMessage::ListTools {
+                    server,
+                    response_tx,
+                }) => {
+                    let result = self.list_tools_async(&mcp_servers, &server).await;
+                    let _ = response_tx.send(result);
+                }
+                Some(RhaiMessage::CallTool {
+                    server,
+                    tool,
+                    args,
+                    response_tx,
+                }) => {
+                    let result = self
+                        .call_tool_async(&mcp_servers, &server, &tool, &args)
+                        .await;
+                    let _ = response_tx.send(result);
+                }
+                Some(RhaiMessage::WriteFile { path, content }) => {
+                    let write_result = tokio::fs::write(&path, &content).await;
+                    let update = match write_result {
+                        Ok(()) => ToolCallUpdate::new(
+                            "write_file_id",
+                            ToolCallUpdateFields::new()
+                                .status(ToolCallStatus::Completed)
+                                .locations(vec![ToolCallLocation::new(&path)])
+                                .content(vec![
+                                    ContentBlock::Text(TextContent::new("Finished writing file."))
+                                        .into(),
+                                ]),
+                        ),
+                        Err(e) => ToolCallUpdate::new(
+                            "write_file_id",
+                            ToolCallUpdateFields::new()
+                                .status(ToolCallStatus::Failed)
+                                .locations(vec![ToolCallLocation::new(&path)])
+                                .content(vec![
+                                    ContentBlock::Text(TextContent::new(format!("{:?}", e))).into(),
+                                ]),
+                        ),
+                    };
+                    cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::ToolCallUpdate(update),
+                    ))?;
+                }
+                None => {
+                    // Script finished
+                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                }
+            }
+        }
+    }
+
+    /// Relay mode: execute the prompt text directly as a Rhai script
+    async fn process_relay_prompt(
+        &self,
+        request: PromptRequest,
+        responder: Responder<PromptResponse>,
+        cx: ConnectionTo<Client>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let session_id = request.session_id.clone();
+
         let input_text = extract_text_from_prompt(&request.prompt);
         let script = extract_rhai_script(&input_text);
 
@@ -117,18 +466,14 @@ impl RhaiAgent {
             script
         );
 
-        // Get session data
         let (cwd, mcp_servers) = self.get_session_data(&session_id).unwrap_or_default();
 
-        // Create channel for Rhai -> async communication
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<RhaiMessage>();
 
-        // Spawn blocking task to run Rhai
         let script_clone = script.clone();
         let rhai_handle =
             tokio::task::spawn_blocking(move || run_rhai_script(&script_clone, msg_tx, &cwd));
 
-        // Process messages from Rhai execution
         while let Some(msg) = msg_rx.recv().await {
             match msg {
                 RhaiMessage::Say(text) => {
@@ -136,6 +481,12 @@ impl RhaiAgent {
                     cx.send_notification(SessionNotification::new(
                         session_id.clone(),
                         SessionUpdate::AgentMessageChunk(ContentChunk::new(text.into())),
+                    ))?;
+                }
+                RhaiMessage::UserMessage(text) => {
+                    cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::UserMessageChunk(ContentChunk::new(text.into())),
                     ))?;
                 }
                 RhaiMessage::ListTools {
@@ -157,10 +508,9 @@ impl RhaiAgent {
                     let _ = response_tx.send(result);
                 }
                 RhaiMessage::WriteFile { path, content } => {
-                    // Attempt to write the file asynchronously
                     let write_result = tokio::fs::write(&path, content).await;
                     match write_result {
-                        Ok(_) => {
+                        Ok(()) => {
                             let update = ToolCallUpdate::new(
                                 "write_file_id",
                                 ToolCallUpdateFields::new()
@@ -196,16 +546,17 @@ impl RhaiAgent {
                         }
                     }
                 }
+                RhaiMessage::ReceivePrompt { .. } => {
+                    tracing::warn!("receive_prompt() called in relay mode — ignoring");
+                }
             }
         }
 
-        // Wait for Rhai to complete and handle any errors
         match rhai_handle.await {
             Ok(Ok(())) => {
                 tracing::debug!(?session_id, "Rhai script completed successfully");
             }
             Ok(Err(e)) => {
-                // Rhai execution error - send error info to client
                 let error_msg = format!("Rhai error: {}", e);
                 tracing::warn!(?session_id, ?error_msg, "Rhai script failed");
                 cx.send_notification(SessionNotification::new(
@@ -214,7 +565,6 @@ impl RhaiAgent {
                 ))?;
             }
             Err(e) => {
-                // Task panicked
                 let error_msg = format!("Rhai task panicked: {}", e);
                 tracing::error!(?session_id, ?error_msg, "Rhai task panic");
                 cx.send_notification(SessionNotification::new(
@@ -381,21 +731,16 @@ impl RhaiAgent {
 }
 
 /// Extract the result value from a CallToolResult.
-/// Prefers structured_content if available, otherwise tries to parse
-/// the first text content item as JSON, falling back to returning it as a string.
 fn extract_tool_result(result: rmcp::model::CallToolResult) -> Result<serde_json::Value, String> {
-    // Prefer structured_content if available
     if let Some(structured) = result.structured_content {
         return Ok(structured);
     }
 
-    // Fall back to first text content
     if let Some(text_content) = result.content.first().and_then(|c| c.as_text()) {
         return Ok(serde_json::from_str(&text_content.text)
             .unwrap_or_else(|_| serde_json::Value::String(text_content.text.clone())));
     }
 
-    // No usable content
     Err("Tool returned no content".to_string())
 }
 
@@ -405,26 +750,66 @@ impl Default for RhaiAgent {
     }
 }
 
-/// Run a Rhai script with the given message channel
+/// Run a Rhai script in relay mode (single prompt execution)
 fn run_rhai_script(
     script: &str,
     msg_tx: mpsc::UnboundedSender<RhaiMessage>,
     cwd: &str,
 ) -> Result<(), String> {
     let mut engine = Engine::new();
+    register_common_functions(&mut engine, msg_tx, cwd);
+    engine.run(script).map_err(|e| e.to_string())
+}
 
-    // Register cwd() function
+/// Run a scripted session (long-lived script with receive_prompt())
+fn run_scripted_session(
+    script: &str,
+    msg_tx: mpsc::UnboundedSender<RhaiMessage>,
+    cwd: &str,
+    is_load: bool,
+) {
+    let mut engine = Engine::new();
+    register_common_functions(&mut engine, msg_tx.clone(), cwd);
+
+    // Register receive_prompt() — blocks until a prompt is delivered
+    let prompt_msg_tx = msg_tx.clone();
+    engine.register_fn("receive_prompt", move || -> String {
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let _ = prompt_msg_tx.send(RhaiMessage::ReceivePrompt { response_tx });
+        match response_rx.recv() {
+            Ok(text) => text,
+            Err(_) => panic!("Session closed while waiting for prompt"),
+        }
+    });
+
+    // Register user() — emit a user message chunk (for replay)
+    let user_tx = msg_tx.clone();
+    engine.register_fn("user", move |text: &str| {
+        let _ = user_tx.send(RhaiMessage::UserMessage(text.to_string()));
+    });
+
+    // Register is_load variable
+    engine.register_fn("is_load", move || -> bool { is_load });
+
+    if let Err(e) = engine.run(script) {
+        tracing::warn!("Scripted session failed: {}", e);
+    }
+}
+
+/// Register functions common to both relay and scripted modes
+fn register_common_functions(
+    engine: &mut Engine,
+    msg_tx: mpsc::UnboundedSender<RhaiMessage>,
+    cwd: &str,
+) {
     let cwd_value = cwd.to_string();
     engine.register_fn("cwd", move || -> String { cwd_value.clone() });
 
-    // Register say() function
     let say_tx = msg_tx.clone();
     engine.register_fn("say", move |text: &str| {
         let _ = say_tx.send(RhaiMessage::Say(text.to_string()));
     });
 
-    // FIXME: In the future, could make this return a bool/error based on the results
-    // Register write_file(path, content)
     let write_tx = msg_tx.clone();
     engine.register_fn("write_file", move |path: &str, content: &str| {
         let _ = write_tx.send(RhaiMessage::WriteFile {
@@ -433,13 +818,9 @@ fn run_rhai_script(
         });
     });
 
-    // Register mcp module
     let mcp_module = McpModule::new(msg_tx);
     let module: Module = mcp_module.into();
     engine.register_static_module("mcp", module.into());
-
-    // Execute the script
-    engine.run(script).map_err(|e| e.to_string())
 }
 
 /// Extract text content from prompt blocks
@@ -455,8 +836,6 @@ fn extract_text_from_prompt(blocks: &[ContentBlock]) -> String {
 }
 
 /// Extract Rhai script from input text
-/// If the text contains `<userRequest>...</userRequest>`, extract that content
-/// Otherwise, treat the entire text as a Rhai script
 fn extract_rhai_script(input: &str) -> String {
     if let (Some(start), Some(end)) = (input.find("<userRequest>"), input.find("</userRequest>")) {
         let content_start = start + "<userRequest>".len();
@@ -465,7 +844,6 @@ fn extract_rhai_script(input: &str) -> String {
         }
     }
 
-    // Otherwise, use the whole input as the script
     input.trim().to_string()
 }
 
@@ -491,8 +869,8 @@ impl ConnectTo<Client> for RhaiAgent {
             .on_receive_request(
                 {
                     let agent = self.clone();
-                    async move |request: NewSessionRequest, responder, _cx| {
-                        agent.handle_new_session(request, responder).await
+                    async move |request: NewSessionRequest, responder, cx| {
+                        agent.handle_new_session(request, responder, cx).await
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -500,8 +878,26 @@ impl ConnectTo<Client> for RhaiAgent {
             .on_receive_request(
                 {
                     let agent = self.clone();
-                    async move |request: LoadSessionRequest, responder, _cx| {
-                        agent.handle_load_session(request, responder).await
+                    async move |request: LoadSessionRequest, responder, cx| {
+                        agent.handle_load_session(request, responder, cx).await
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = self.clone();
+                    async move |request: ResumeSessionRequest, responder, cx| {
+                        agent.handle_resume_session(request, responder, cx).await
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = self.clone();
+                    async move |request: ListSessionsRequest, responder, _cx| {
+                        agent.handle_list_sessions(request, responder)
                     }
                 },
                 agent_client_protocol::on_receive_request!(),

@@ -11,11 +11,12 @@
 
 use std::path::PathBuf;
 
+use agent_client_protocol::schema::SessionId;
 use agent_client_protocol::{AcpAgent, ConnectTo};
 use anyhow::Result;
 use clap::Parser;
-use rhaicp::RhaiAgent;
 use rhaicp::client::RhaiClient;
+use rhaicp::{PriorSession, RhaiAgent};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -32,7 +33,14 @@ struct Args {
 #[derive(clap::Subcommand, Debug)]
 enum Command {
     /// Run as ACP agent over stdio
-    Acp,
+    Acp {
+        /// Prior sessions in the form "session_id:script_path"
+        #[arg(short, long = "session", value_parser = parse_session_arg)]
+        sessions: Vec<(String, PathBuf)>,
+        /// Script to run for new sessions (instead of relay mode)
+        #[arg(long = "new-session")]
+        new_session_script: Option<PathBuf>,
+    },
     /// Run a Rhai script as a client against an external agent
     Client {
         /// Path to the Rhai script file
@@ -44,11 +52,17 @@ enum Command {
     },
 }
 
+fn parse_session_arg(s: &str) -> Result<(String, PathBuf), String> {
+    let (id, path) = s
+        .split_once(':')
+        .ok_or_else(|| format!("expected 'session_id:script_path', got '{s}'"))?;
+    Ok((id.to_string(), PathBuf::from(path)))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize tracing to stderr
     let env_filter = if args.debug {
         EnvFilter::new("rhaicp=debug")
     } else {
@@ -65,9 +79,39 @@ async fn main() -> Result<()> {
         .init();
 
     match args.command {
-        Command::Acp => {
+        Command::Acp {
+            sessions,
+            new_session_script,
+        } => {
             tracing::info!("Rhaicp starting");
-            RhaiAgent::new()
+
+            let prior_sessions: Vec<PriorSession> = sessions
+                .into_iter()
+                .map(|(id, path)| {
+                    let script = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                        panic!("Failed to read session script {:?}: {}", path, e)
+                    });
+                    PriorSession {
+                        session_id: SessionId::new(id),
+                        script,
+                    }
+                })
+                .collect();
+
+            let mut agent = RhaiAgent::new();
+
+            if !prior_sessions.is_empty() {
+                agent = agent.prior_sessions(prior_sessions);
+            }
+
+            if let Some(script_path) = new_session_script {
+                let script = std::fs::read_to_string(&script_path).unwrap_or_else(|e| {
+                    panic!("Failed to read new-session script {:?}: {}", script_path, e)
+                });
+                agent = agent.new_session_script(script);
+            }
+
+            agent
                 .connect_to(agent_client_protocol::Stdio::new())
                 .await?;
         }
