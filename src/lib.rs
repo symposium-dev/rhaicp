@@ -385,11 +385,9 @@ fn extract_tool_result(result: rmcp::model::CallToolResult) -> Result<serde_json
     }
 
     // Fall back to first text content
-    if let Some(content) = result.content.first() {
-        if let Some(text_content) = content.as_text() {
-            return Ok(serde_json::from_str(&text_content.text)
-                .unwrap_or_else(|_| serde_json::Value::String(text_content.text.clone())));
-        }
+    if let Some(text_content) = result.content.first().and_then(|c| c.as_text()) {
+        return Ok(serde_json::from_str(&text_content.text)
+            .unwrap_or_else(|_| serde_json::Value::String(text_content.text.clone())));
     }
 
     // No usable content
@@ -447,12 +445,10 @@ fn extract_text_from_prompt(blocks: &[ContentBlock]) -> String {
 /// If the text contains `<userRequest>...</userRequest>`, extract that content
 /// Otherwise, treat the entire text as a Rhai script
 fn extract_rhai_script(input: &str) -> String {
-    if let Some(start) = input.find("<userRequest>") {
-        if let Some(end) = input.find("</userRequest>") {
-            let content_start = start + "<userRequest>".len();
-            if content_start < end {
-                return input[content_start..end].trim().to_string();
-            }
+    if let (Some(start), Some(end)) = (input.find("<userRequest>"), input.find("</userRequest>")) {
+        let content_start = start + "<userRequest>".len();
+        if content_start < end {
+            return input[content_start..end].trim().to_string();
         }
     }
 
